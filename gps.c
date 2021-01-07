@@ -35,6 +35,10 @@
 #include <cutils/properties.h>
 #include <hardware/gps.h>
 
+#if (12 <= __ANDROID_API__) || defined(_BSD_SOURCE) || defined(_SVID_SOURCE) || defined(_DEFAULT_SOURCE)
+    #define _USE_TIMEGM
+#endif
+
 /* this is the state of our connection to the qemu_gpsd daemon */
 typedef struct {
     int                     init;
@@ -47,6 +51,10 @@ typedef struct {
 
 static GpsState  _gps_state[1];
 static int    id_in_fixed[12];
+static unsigned short period_in_ms;
+static long           time_sync;
+
+//#define  GPS_DEBUG  1
 
 #define  DFR(...)   ALOGD(__VA_ARGS__)
 
@@ -63,6 +71,8 @@ static void gps_dev_init(int fd);
 static void gps_dev_deinit(int fd);
 static void gps_dev_start(int fd);
 static void gps_dev_stop(int fd);
+
+static void gps_dev_set_meas_rate(int fd, unsigned short period_ms);
 
 /*****************************************************************/
 /*****************************************************************/
@@ -90,7 +100,7 @@ static int
 nmea_tokenizer_init( NmeaTokenizer*  t, const char*  p, const char*  end )
 {
     int    count = 0;
-    char*  q;
+    //char* q;
 
     // the initial '$' is optional
     if (p < end && p[0] == '$')
@@ -201,7 +211,8 @@ typedef struct {
     int     utc_year;
     int     utc_mon;
     int     utc_day;
-    int     utc_diff;
+    //time_t  utc_diff;
+    bool    gsa; // TRUE if GSA sentence was detected
     GpsLocation  fix;
     GpsSvStatus sv_status;
     gps_location_callback  callback;
@@ -236,7 +247,7 @@ void update_gps_location(GpsLocation *fix)
         state->callbacks->location_cb(fix);
 }
 
-
+/*
 static void
 nmea_reader_update_utc_diff( NmeaReader*  r )
 {
@@ -262,7 +273,18 @@ nmea_reader_update_utc_diff( NmeaReader*  r )
 
     r->utc_diff = time_utc - time_local;
 }
+*/
 
+#ifndef _USE_TIMEGM
+
+static time_t get_utc_diff()
+{
+    // 3rd January, 1970, Time: 00:00:00
+    static struct tm tm = { 0, 0, 0, 3, 0, 70, 0, 0, -1 };
+    return (2 * 24 * 3600) - mktime(&tm);
+}
+
+#endif // _USE_TIMEGM
 
 static void
 nmea_reader_init( NmeaReader*  r )
@@ -274,10 +296,11 @@ nmea_reader_init( NmeaReader*  r )
     r->utc_year = -1;
     r->utc_mon  = -1;
     r->utc_day  = -1;
+    r->gsa      = false;
     r->callback = NULL;
     r->fix.size = sizeof(r->fix);
 
-    nmea_reader_update_utc_diff( r );
+    //nmea_reader_update_utc_diff( r );
 }
 
 
@@ -294,12 +317,11 @@ nmea_reader_set_callback( NmeaReader*  r, gps_location_callback  cb )
 
 
 static int
-nmea_reader_update_time( NmeaReader*  r, Token  tok )
+nmea_reader_update_time( NmeaReader*  r, Token  tok, time_t *gmt )
 {
     int        hour, minute;
     double     seconds;
     struct tm  tm;
-    time_t     fix_time;
 
     if (tok.p + 6 > tok.end)
         return -1;
@@ -313,28 +335,28 @@ nmea_reader_update_time( NmeaReader*  r, Token  tok )
         r->utc_day  = tm.tm_mday;
     }
 
-    hour    = str2int(tok.p,   tok.p+2);
-    minute  = str2int(tok.p+2, tok.p+4);
-    seconds = str2float(tok.p+4, tok.end);
-
-    tm.tm_hour  = hour;
-    tm.tm_min   = minute;
-    tm.tm_sec   = (int) seconds;
+    tm.tm_hour  = str2int(tok.p, tok.p+2);
+    tm.tm_min   = str2int(tok.p+2, tok.p+4);
+    tm.tm_sec   = (int) str2float(tok.p+4, tok.end);
     tm.tm_year  = r->utc_year - 1900;
     tm.tm_mon   = r->utc_mon - 1;
     tm.tm_mday  = r->utc_day;
     tm.tm_isdst = -1;
 
-    fix_time = mktime( &tm ) + r->utc_diff;
-    r->fix.timestamp = (long long)fix_time * 1000;
+#ifdef _USE_TIMEGM
+    *gmt = timegm( &tm );
+#else
+    *gmt = mktime( &tm ) + get_utc_diff();
+#endif
+    r->fix.timestamp = (long long) *gmt * 1000;
     return 0;
 }
 
 
 static int
-nmea_reader_update_date( NmeaReader*  r, Token  date, Token  time )
+nmea_reader_update_date( NmeaReader*  r, Token  date_tok, Token  time_tok )
 {
-    Token  tok = date;
+    Token  tok = date_tok;
     int    day, mon, year;
 
     if (tok.p + 6 != tok.end) {
@@ -354,7 +376,21 @@ nmea_reader_update_date( NmeaReader*  r, Token  date, Token  time )
     r->utc_mon   = mon;
     r->utc_day   = day;
 
-    return nmea_reader_update_time( r, time );
+    time_t gmt;
+    int result = nmea_reader_update_time( r, time_tok, &gmt );
+
+    if (0 < time_sync)
+    {
+        long dif = (long) (time(NULL) - gmt);
+        if (dif < -time_sync || time_sync < dif)
+        {
+            D("System time synchronized with the GPS");
+            struct timeval tv = { gmt, 0 };
+            settimeofday(&tv, NULL);
+        }
+    }
+
+    return result;
 }
 
 
@@ -409,7 +445,7 @@ nmea_reader_update_altitude( NmeaReader*  r,
                              Token        altitude,
                              Token        units )
 {
-    double  alt;
+    //double  alt;
     Token   tok = altitude;
 
     if (tok.p >= tok.end)
@@ -420,22 +456,20 @@ nmea_reader_update_altitude( NmeaReader*  r,
     return 0;
 }
 
-
-static int nmea_reader_update_accuracy( NmeaReader*  r,
-                             Token        accuracy )
+static int nmea_reader_update_accuracy(NmeaReader* r, Token accuracy, bool is_fix)
 {
-    double  acc;
+    //double  acc;
     Token   tok = accuracy;
 
     if (tok.p >= tok.end)
         return -1;
 
-    r->fix.accuracy = str2float(tok.p, tok.end);
-    if (r->fix.accuracy == 99.99){
+    r->fix.accuracy = (float) str2float(tok.p, tok.end);
+    if (99.0f < r->fix.accuracy)
       return 0;
-    }
 
-    r->fix.flags   |= GPS_LOCATION_HAS_ACCURACY;
+    if (is_fix)
+        r->fix.flags |= GPS_LOCATION_HAS_ACCURACY;
     return 0;
 }
 
@@ -444,7 +478,7 @@ static int
 nmea_reader_update_bearing( NmeaReader*  r,
                             Token        bearing )
 {
-    double  alt;
+    //double  alt;
     Token   tok = bearing;
 
     if (tok.p >= tok.end)
@@ -460,14 +494,14 @@ static int
 nmea_reader_update_speed( NmeaReader*  r,
                           Token        speed )
 {
-    double  alt;
+    //double  alt;
     Token   tok = speed;
 
     if (tok.p >= tok.end)
         return -1;
 
     r->fix.flags   |= GPS_LOCATION_HAS_SPEED;
-    r->fix.speed    = str2float(tok.p, tok.end) * 1.852 / 3.6;
+    r->fix.speed = (float) (str2float(tok.p, tok.end) * (1.852 / 3.6));
     return 0;
 }
 
@@ -531,8 +565,11 @@ nmea_reader_parse( NmeaReader*  r )
         D("Sentence id '%.*s' too short, ignored.", tok.end-tok.p, tok.p);
         return;
     }
+
     // ignore first two characters.
     tok.p += 2;
+
+    bool send_msg = false;
     if ( !memcmp(tok.p, "GGA", 3) ) {
         // GPS fix
         Token  tok_time          = nmea_tokenizer_get(tzer,1);
@@ -540,19 +577,25 @@ nmea_reader_parse( NmeaReader*  r )
         Token  tok_latitudeHemi  = nmea_tokenizer_get(tzer,3);
         Token  tok_longitude     = nmea_tokenizer_get(tzer,4);
         Token  tok_longitudeHemi = nmea_tokenizer_get(tzer,5);
+        Token  tok_fix           = nmea_tokenizer_get(tzer,6);
         Token  tok_accuracy      = nmea_tokenizer_get(tzer,8);
         Token  tok_altitude      = nmea_tokenizer_get(tzer,9);
         Token  tok_altitudeUnits = nmea_tokenizer_get(tzer,10);
 
-        nmea_reader_update_time(r, tok_time);
-        nmea_reader_update_latlong(r, tok_latitude,
-                                      tok_latitudeHemi.p[0],
-                                      tok_longitude,
-                                      tok_longitudeHemi.p[0]);
+        int fix = str2int(tok_fix.p, tok_fix.end);
+        if (0 < fix)
+        {
+            time_t gmt;
+            nmea_reader_update_time(r, tok_time, &gmt);
+            nmea_reader_update_latlong(r, tok_latitude, tok_latitudeHemi.p[0], tok_longitude, tok_longitudeHemi.p[0]);
         nmea_reader_update_altitude(r, tok_altitude, tok_altitudeUnits);
+        }
 
-        nmea_reader_update_accuracy(r, tok_accuracy);
-
+        if (!r->gsa)
+        {
+            nmea_reader_update_accuracy(r, tok_accuracy, 0 < fix);
+            send_msg = true;
+        }
     } else if ( !memcmp(tok.p, "GSA", 3) ) {
         /*
           1    = Mode:
@@ -567,14 +610,21 @@ nmea_reader_parse( NmeaReader*  r )
           16   = HDOP
           17   = VDOP
         */
-        Token tok_mode = nmea_tokenizer_get(tzer,1);
+        if (r->gsa)
+        {
+            //Token tok_mode = nmea_tokenizer_get(tzer,1);
         Token tok_fix  = nmea_tokenizer_get(tzer,2);
-        Token tok_id  = nmea_tokenizer_get(tzer,3);
-        Token tok_pdop = nmea_tokenizer_get(tzer,15);
+            //Token tok_id   = nmea_tokenizer_get(tzer,3);
+            //Token tok_pdop = nmea_tokenizer_get(tzer,15);
         Token tok_hdop = nmea_tokenizer_get(tzer,16);
-        Token tok_vdop = nmea_tokenizer_get(tzer,17);
+            //Token tok_vdop = nmea_tokenizer_get(tzer,17);
 
-        nmea_reader_update_accuracy(r, tok_hdop);
+            int fix = str2int(tok_fix.p, tok_fix.end);
+            if (fix == 2)
+                r->fix.flags &= ~GPS_LOCATION_HAS_ALTITUDE;
+
+            nmea_reader_update_accuracy(r, tok_hdop, 1 < fix);
+            send_msg = true;
 
         int i;
         for ( i=0; i<12; i++ ) {
@@ -584,6 +634,9 @@ nmea_reader_parse( NmeaReader*  r )
 		D("Satellite used '%.*s'", tok_id.end-tok_id.p, tok_id.p);
 	    }
         }
+        }
+
+        r->gsa = true;
     } else if ( !memcmp(tok.p, "GSV", 3) ) {
 	/*
         1    = Total number of messages of this type in this cycle
@@ -702,11 +755,15 @@ nmea_reader_parse( NmeaReader*  r )
         D("%s\n", temp);
     }
 #endif
-    if (r->fix.flags & GPS_LOCATION_HAS_ACCURACY) {
-        if (_gps_state->callbacks->location_cb) {
+    if (send_msg)
+    {
+        if (_gps_state->callbacks->location_cb)
+        {
             _gps_state->callbacks->location_cb( &r->fix );
             r->fix.flags = 0;
-        } else {
+        }
+        else
+        {
             D("No callback, keeping data until needed !");
         }
     }
@@ -890,12 +947,14 @@ gps_state_thread( void*  arg )
                             D("GPS thread starting  location_cb=%p", state->callbacks->location_cb);
                             started = 1;
                             update_gps_status(GPS_STATUS_SESSION_BEGIN);
+                            gps_dev_set_meas_rate(state->fd, period_in_ms);
                         }
                     } else if (cmd == CMD_STOP) {
                         if (started) {
                             D("GPS thread stopping");
                             started = 0;
                             update_gps_status(GPS_STATUS_SESSION_END);
+                            gps_dev_set_meas_rate(state->fd, GPS_DEV_SLOW_UPDATE_RATE * 1000);
                         }
                     }
                 } else if (fd == gps_fd) {
@@ -927,7 +986,6 @@ static void
 gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
 {
     char   prop[PROPERTY_VALUE_MAX];
-    char   baud[PROPERTY_VALUE_MAX];
     char   device[256];
     int    ret;
     int    done = 0;
@@ -959,6 +1017,26 @@ gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
 
     D("GPS will read from %s", device);
 
+    period_in_ms = GPS_DEV_HIGH_UPDATE_RATE * 1000;
+    if (property_get("ro.kernel.android.gps.max_rate", prop, "") != 0)
+    {
+        unsigned long rate = strtoul(prop, NULL, 10);
+        if (0 < rate && rate < 66)
+            period_in_ms = (unsigned short) (rate * 1000);
+        else if (250 <= rate && rate < 65536)
+            period_in_ms = (unsigned short) rate;
+    }
+
+    D("measure rate is set to %u ms", period_in_ms);
+
+    time_sync = false;
+    if (property_get("ro.kernel.android.gps.time_sync", prop, "") != 0)
+    {
+        time_sync = atol(prop);
+    }
+
+    D("time_sync is %s", (time_sync) ? "enabled" : "disabled");
+
     // Disable echo on serial lines
     if ( isatty( state->fd ) ) {
         struct termios  ios;
@@ -968,32 +1046,34 @@ gps_state_init( GpsState*  state, GpsCallbacks* callbacks )
         ios.c_iflag &= (~(ICRNL | INLCR)); /* Stop \r -> \n & \n -> \r translation on input */
         ios.c_iflag |= (IGNCR | IXOFF);  /* Ignore \r & XON/XOFF on input */
 	// Set baud rate and other flags
-        property_get("ro.kernel.android.gpsttybaud",baud,"9600");
-        if (strcmp(baud, "4800") == 0) {
+        property_get("ro.kernel.android.gpsttybaud",prop,"9600");
+        if (strcmp(prop, "4800") == 0) {
             ALOGE("Setting gps baud rate to 4800");
             ios.c_cflag = B4800 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        } else if (strcmp(baud, "9600") == 0) {
+        } else if (strcmp(prop, "9600") == 0) {
             ALOGE("Setting gps baud rate to 9600");
             ios.c_cflag = B9600 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        } else if (strcmp(baud, "19200") == 0) {
+        } else if (strcmp(prop, "19200") == 0) {
             ALOGE("Setting gps baud rate to 19200");
             ios.c_cflag = B19200 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        } else if (strcmp(baud, "38400") == 0) {
+        } else if (strcmp(prop, "38400") == 0) {
             ALOGE("Setting gps baud rate to 38400");
             ios.c_cflag = B38400 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        } else if (strcmp(baud, "57600") == 0) {
+        } else if (strcmp(prop, "57600") == 0) {
             ALOGE("Setting gps baud rate to 57600");
             ios.c_cflag = B57600 | CRTSCTS | CS8 | CLOCAL | CREAD;
-        } else if (strcmp(baud, "115200") == 0) {
+        } else if (strcmp(prop, "115200") == 0) {
             ALOGE("Setting gps baud rate to 115200");
             ios.c_cflag = B115200 | CRTSCTS | CS8 | CLOCAL | CREAD;
         } else {
-            ALOGE("GPS baud rate unknown: '%s'", baud);
+            ALOGE("GPS baud rate unknown: '%s'", prop);
             return;
         }
 
         tcsetattr( state->fd, TCSANOW, &ios );
     }
+
+    gps_dev_set_meas_rate(state->fd, GPS_DEV_SLOW_UPDATE_RATE * 1000);
 
     if ( socketpair( AF_LOCAL, SOCK_STREAM, 0, state->control ) < 0 ) {
         ALOGE("Could not create thread control socket pair: %s", strerror(errno));
@@ -1159,17 +1239,12 @@ static void gps_dev_power(int state)
 }
 
 
-static void gps_dev_send(int fd, char *msg)
+static void gps_dev_send(int fd, char *msg, int size)
 {
-    int i, n, ret;
-
-    i = strlen(msg);
-
-    n = 0;
-
+    int n = 0;
     do {
 
-        ret = write(fd, msg + n, i - n);
+        int ret = write(fd, msg + n, size - n);
 
         if (ret < 0 && errno == EINTR) {
             continue;
@@ -1177,10 +1252,17 @@ static void gps_dev_send(int fd, char *msg)
 
         n += ret;
 
-    } while (n < i);
+    } while (n < size);
 }
 
-
+//
+// Both following UBX commands 40 and 41 are proprietary and most of SatNav devices must not support them or must not recognize used format.
+// E.g. u-blox-5 chipset expects 5 rate parameters in UBX 40 command because it has 5 I/O ports.
+// In addition, UBX 40 command doesn't change fix computation frequency, so it cannot influence a power consumption of USB module.
+// But we can use another UBX command CFG-RATE which is probably supported by more devices and its format is clear.
+// CFG_RATE controls computation frequency and thus it influences a power consumption.
+//
+/*
 static unsigned char gps_dev_calc_nmea_csum(char *msg)
 {
     unsigned char csum = 0;
@@ -1205,7 +1287,7 @@ static void gps_dev_set_nmea_message_rate(int fd, char *msg, int rate)
 
     sprintf((buff + i), "%02x\r\n", gps_dev_calc_nmea_csum(buff));
 
-    gps_dev_send(fd, buff);
+    gps_dev_send(fd, buff, strlen(buff));
 
     D("GPS sent to device: %s", buff);
 }
@@ -1224,7 +1306,7 @@ static void gps_dev_set_baud_rate(int fd, int baud)
 
         sprintf((buff + i), "%02x\r\n", gps_dev_calc_nmea_csum(buff));
 
-        gps_dev_send(fd, buff);
+        gps_dev_send(fd, buff, strlen(buff));
 
         D("Sent to device: %s", buff);
 
@@ -1248,26 +1330,48 @@ static void gps_dev_set_message_rate(int fd, int rate)
 
     return;
 }
+*/
 
+static void gps_dev_calc_ubx_csum(unsigned char *msg, int size, unsigned char *ck_a, unsigned char *ck_b)
+{
+    *ck_a = *ck_b = 0;
+    for (int i = 0; i < size; ++i)
+    {
+        *ck_a += msg[i];
+        *ck_b += *ck_a;
+    }
+}
 
 static void gps_dev_init(int fd)
 {
-    gps_dev_power(1);
-
     return;
 }
 
 
 static void gps_dev_deinit(int fd)
 {
-    gps_dev_power(0);
+    return;
+}
+
+static void gps_dev_set_meas_rate(int fd, unsigned short period_ms)
+{
+    // B5 62 06 08 06 00 F4 01 01 00 01 00 0B 77
+    unsigned char buff[14] = "\xB5\x62\x06\x08\x06\x00";
+
+    *((unsigned short *)(buff + 6)) = period_ms;
+    *((unsigned short *)(buff + 8)) = 1;
+    *((unsigned short *)(buff + 10)) = 1;
+
+    gps_dev_calc_ubx_csum(buff + 2, 10, buff + 12, buff + 13);
+
+    gps_dev_send(fd, (char *)buff, sizeof(buff));
 }
 
 
 static void gps_dev_start(int fd)
 {
     // Set full message rate
-    gps_dev_set_message_rate(fd, GPS_DEV_HIGH_UPDATE_RATE);
+    //gps_dev_set_message_rate(fd, GPS_DEV_HIGH_UPDATE_RATE);
 
     D("GPS dev start initiated");
 }
@@ -1276,7 +1380,7 @@ static void gps_dev_start(int fd)
 static void gps_dev_stop(int fd)
 {
     // Set slow message rate
-    gps_dev_set_message_rate(fd, GPS_DEV_SLOW_UPDATE_RATE);
+    //gps_dev_set_message_rate(fd, GPS_DEV_SLOW_UPDATE_RATE);
 
     D("GPS dev stop initiated");
 }
